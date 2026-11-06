@@ -1,0 +1,14 @@
+.DS_Store
+*.xcodeproj/
+DerivedData/
+build/
+*.ipa
+*.xcarchive
+*.p8
+*.p12
+*.cer
+*.mobileprovision
+fastlane/report.xml
+fastlane/README.md
+vendor/
+.bundle/

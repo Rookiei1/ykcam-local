@@ -1,0 +1,121 @@
+name: Upload to TestFlight
+
+# Public repository: logs are world-readable, so this workflow
+# - runs only when the owner starts it by hand on main (never from forks or pull requests)
+# - gives secrets only to the steps that need them, after every third-party action has finished
+# - pins third-party actions to exact commits
+# - uploads no artifacts (the IPA and build logs stay on the disposable runner)
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ykcam-apple-signing
+  cancel-in-progress: false
+
+jobs:
+  upload:
+    if: github.ref == 'refs/heads/main' && github.actor == github.repository_owner
+    name: Sign and upload to TestFlight
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      FASTLANE_SKIP_UPDATE_CHECK: "1"
+      FASTLANE_HIDE_CHANGELOG: "1"
+      FASTLANE_OPT_OUT_USAGE: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1
+        with:
+          xcode-version: '26.3'
+
+      - name: Show upload toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Set up Ruby and fastlane
+        uses: ruby/setup-ruby@de492cf36cbab201753d720ce4f4e336cd688c94 # v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+
+      - name: Check upload script syntax
+        run: |
+          ruby -c fastlane/Fastfile
+          ruby -c ci/signing_identity.rb
+          bundle exec ruby ci/test_profile_certificates.rb
+          python3 ci/test_release_plists.py
+
+      - name: Generate project
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Run unit tests
+        timeout-minutes: 12
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/logs
+          DEVICE_ID="$(xcrun simctl list devices available -j | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(d["udid"] for devices in data["devices"].values() for d in devices if d.get("isAvailable") and d["name"].startswith("iPhone")))')"
+          xcodebuild test \
+            -project YKCam.xcodeproj \
+            -scheme YKCam \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$DEVICE_ID" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            > build/logs/unit-tests.log 2>&1 || {
+              tail -n 180 build/logs/unit-tests.log
+              exit 1
+            }
+          grep -E "Executed [0-9]+ tests" build/logs/unit-tests.log | tail -n 1
+
+      - name: Prepare Apple API key
+        run: python3 ci/prepare_apple_key.py
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+
+      - name: Prepare read-only access to the private signing store
+        shell: bash
+        env:
+          SIGNING_DEPLOY_KEY: ${{ secrets.SIGNING_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          printf '%s\n' "$SIGNING_DEPLOY_KEY" > "$HOME/.ssh/ykcam_signing"
+          chmod 600 "$HOME/.ssh/ykcam_signing"
+          echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' >> "$HOME/.ssh/known_hosts"
+          printf 'Host github.com\n  IdentityFile ~/.ssh/ykcam_signing\n  IdentitiesOnly yes\n' >> "$HOME/.ssh/config"
+
+      - name: Sign, verify and upload to TestFlight
+        timeout-minutes: 45
+        run: bundle exec fastlane ios release_testflight
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD_NEXT }}
+          SIGNING_CERTIFICATE_ID: ${{ secrets.SIGNING_CERTIFICATE_ID }}
+          SIGNING_STORE_URL: ${{ secrets.SIGNING_STORE_URL }}
+
+      - name: Remove temporary keys and keychain
+        if: always()
+        shell: bash
+        run: |
+          rm -f "$HOME/.ssh/ykcam_signing"
+          rm -rf "$RUNNER_TEMP/ykcam-asc"
+          if [[ -f "$HOME/Library/Keychains/fastlane_tmp_keychain-db" ]]; then
+            security delete-keychain "$HOME/Library/Keychains/fastlane_tmp_keychain-db" || true
+          fi

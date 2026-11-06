@@ -1,0 +1,66 @@
+name: YKCam
+options:
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.3.0"
+    CURRENT_PROJECT_VERSION: "1"
+    YKCAM_PROFILE: "match AppStore com.rookiei1.ykcam"
+targets:
+  YKCam:
+    type: application
+    platform: iOS
+    sources:
+      - path: YKCam
+    info:
+      path: YKCam/Info.plist
+      properties:
+        # 版本号跟着工程设置走（XcodeGen 默认写 1.0，会和 MARKETING_VERSION 对不上，发布检查会拦下）
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        UIBackgroundModes:
+          - audio
+        NSPhotoLibraryAddUsageDescription: 手机被人拿走时的前置录像，录完存一份到相册。
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.rookiei1.ykcam
+        PRODUCT_NAME: YKCam
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: 门口摄像头
+        INFOPLIST_KEY_CFBundleIconName: AppIcon
+        INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: UIInterfaceOrientationPortrait
+        INFOPLIST_KEY_UIStatusBarHidden: YES
+        INFOPLIST_KEY_NSCameraUsageDescription: 对着门拍照录像；手机被人拿起时用前置摄像头拍拿手机的人。照片和录像只存在这台手机上。
+        INFOPLIST_KEY_NSMicrophoneUsageDescription: 录像时同时录声音，只存在这台手机上。
+        INFOPLIST_KEY_NSMotionUsageDescription: 感觉手机是否被人拿起、碰歪。
+        INFOPLIST_KEY_NSFaceIDUsageDescription: 只有机主能停止警报、停止监控和查看记录。
+        INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription: 手机被人拿走时的前置录像，录完存一份到相册。
+        TARGETED_DEVICE_FAMILY: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        SDKROOT: iphoneos
+        SKIP_INSTALL: NO
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "Apple Distribution"
+        PROVISIONING_PROFILE_SPECIFIER: "$(YKCAM_PROFILE)"
+    scheme:
+      gatherCoverageData: false
+      testTargets:
+        - YKCamTests
+  YKCamTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests
+    dependencies:
+      - target: YKCam
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.rookiei1.ykcam.tests
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGNING_ALLOWED: NO

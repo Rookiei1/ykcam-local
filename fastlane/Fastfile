@@ -1,0 +1,195 @@
+require "shellwords"
+require "fileutils"
+require "tmpdir"
+
+default_platform(:ios)
+
+# Signing material lives in a separate private repository. Its address and the
+# certificate id come from GitHub secrets; this public repository holds neither.
+
+APP_BUNDLE_ID = "com.rookiei1.ykcam"
+MATCH_BRANCH = "signing-assets-v2"
+PROJECT_ROOT = File.expand_path(ENV.fetch("GITHUB_WORKSPACE", ".."))
+require File.join(PROJECT_ROOT, "ci", "signing_identity")
+
+def append_summary(text)
+  path = ENV["GITHUB_STEP_SUMMARY"]
+  File.open(path, "a") { |file| file.puts(text) } unless path.to_s.empty?
+  UI.message(text)
+end
+
+platform :ios do
+  private_lane :apple_api do
+    ensure_env_vars(env_vars: ["ASC_KEY_ID", "ASC_ISSUER_ID", "ASC_KEY_PATH"])
+    app_store_connect_api_key(
+      key_id: ENV.fetch("ASC_KEY_ID"),
+      issuer_id: ENV.fetch("ASC_ISSUER_ID"),
+      key_filepath: ENV.fetch("ASC_KEY_PATH"),
+      duration: 1200,
+      in_house: false
+    )
+  end
+
+  private_lane :check_apple_registration do
+    # A key/permission failure must remain an API error, not be reported as a missing app.
+    bundle = Spaceship::ConnectAPI::BundleId.find(APP_BUNDLE_ID)
+    app = Spaceship::ConnectAPI::App.find(APP_BUNDLE_ID)
+    missing = []
+    if bundle.nil?
+      missing << "Developer App ID: https://developer.apple.com/account/resources/identifiers/list (Explicit: #{APP_BUNDLE_ID}; Description: ykcam Camera)"
+    end
+    if app.nil?
+      missing << "App Store Connect app: https://appstoreconnect.apple.com/apps (iOS; 名称 ykcam 门口监控; 简体中文; Bundle ID #{APP_BUNDLE_ID}; SKU ykcam-ios-001)"
+    end
+    unless missing.empty?
+      append_summary("### Apple registration required\n" + missing.map { |item| "- #{item}" }.join("\n"))
+      UI.user_error!("Complete the missing registration before signing or uploading:\n" + missing.join("\n"))
+    end
+    append_summary("### Apple registration preflight passed\n- Developer App ID: `#{APP_BUNDLE_ID}`\n- App Store Connect app ID: `#{app.id}`\n- The current Team API key can read both records.")
+  end
+
+  desc "Read Apple signing information; never create or revoke certificates"
+  lane :diagnose_signing do
+    apple_api
+    check_apple_registration
+    UI.success("Read-only diagnosis passed; no signing assets were changed.")
+  end
+
+  private_lane :install_existing_identity do |options|
+    ensure_env_vars(env_vars: ["MATCH_PASSWORD", "SIGNING_CERTIFICATE_ID", "SIGNING_STORE_URL"])
+    certificate_id = ENV.fetch("SIGNING_CERTIFICATE_ID")
+    remote = Spaceship::ConnectAPI::Certificate.get(certificate_id: certificate_id)
+    UI.user_error!("The signing certificate is unavailable in this Apple Team") if remote.nil?
+    UI.user_error!("Expected a valid existing Distribution certificate") unless remote.valid? && ["DISTRIBUTION", "IOS_DISTRIBUTION"].include?(remote.certificate_type)
+    setup_ci(timeout: 0) if ENV["CI"]
+    ENV["MATCH_READONLY"] = "true"
+    keychain_name = ENV.fetch("MATCH_KEYCHAIN_NAME", "login.keychain")
+    keychain_path = FastlaneCore::Helper.keychain_path(keychain_name)
+    raw = Dir.mktmpdir("ykcam-identity-", ENV.fetch("RUNNER_TEMP"))
+    begin
+      # Only read the saved key. Missing/expired identity cannot create a new certificate.
+      match(
+        type: "appstore",
+        platform: "ios",
+        app_identifier: [APP_BUNDLE_ID],
+        api_key: options.fetch(:api_key),
+        git_url: ENV.fetch("SIGNING_STORE_URL"),
+        git_branch: MATCH_BRANCH,
+        clone_branch_directly: true,
+        readonly: true,
+        certificate_id: certificate_id,
+        skip_provisioning_profiles: true,
+        renew_expired_certs: false,
+        output_path: raw,
+        keychain_name: keychain_name,
+        keychain_password: ENV.fetch("MATCH_KEYCHAIN_PASSWORD", ""),
+        skip_docs: true
+      )
+      identity = YKCamSigning.verify_identity(
+        raw: raw, cert_id: certificate_id,
+        apple_certificate: remote.certificate_content, keychain: keychain_path
+      )
+      append_summary("### Existing identity verified
+The saved certificate decrypted, matched Apple's current certificate and private key, and passed a codesigning probe. No certificate was created, renewed or revoked.")
+      identity
+    ensure
+      FileUtils.remove_entry_secure(raw) if raw && File.directory?(raw)
+    end
+  end
+
+  private_lane :prepare_app_profile do |options|
+    identity = options.fetch(:identity)
+    directory = File.join(ENV.fetch("RUNNER_TEMP"), "ykcam-profile")
+    FileUtils.mkdir_p(directory, mode: 0o700)
+    # sigh can reuse/download a matching profile or prepare this app's profile;
+    # it is pinned to the already verified certificate and creates no identity.
+    get_provisioning_profile(
+      api_key: options.fetch(:api_key),
+      app_identifier: APP_BUNDLE_ID,
+      platform: "ios",
+      cert_id: ENV.fetch("SIGNING_CERTIFICATE_ID"),
+      force: false,
+      skip_certificate_verification: false,
+      skip_install: true,
+      output_path: directory,
+      filename: "YKCam.mobileprovision"
+    )
+    path = lane_context[SharedValues::SIGH_PROFILE_PATH]
+    UI.user_error!("App Store profile was not written") if path.to_s.empty? || !File.file?(path)
+    profile = YKCamSigning.verify_profile(path: path, bundle_id: APP_BUNDLE_ID, identity: identity)
+    FastlaneCore::ProvisioningProfile.install(path)
+    append_summary("### App profile ready
+Profile prepared for `#{APP_BUNDLE_ID}` with the existing certificate.")
+    { team_id: identity.fetch(:team_id), fingerprint: identity.fetch(:fingerprint), profile_name: profile.fetch("Name") }
+  end
+
+  desc "Use existing signing assets, archive the iPhone app, and upload to TestFlight"
+  lane :release_testflight do
+    api_key = apple_api
+    check_apple_registration
+    identity = install_existing_identity(api_key: api_key)
+    signing = prepare_app_profile(api_key: api_key, identity: identity)
+
+    version = get_version_number(
+      xcodeproj: "YKCam.xcodeproj",
+      target: "YKCam"
+    )
+    latest = latest_testflight_build_number(
+      api_key: api_key,
+      app_identifier: APP_BUNDLE_ID,
+      version: version,
+      initial_build_number: 0
+    )
+    floor = 1000 + ENV.fetch("GITHUB_RUN_NUMBER", "1").to_i
+    build_number = [latest.to_i + 1, floor].max
+
+    xcargs = {
+      "DEVELOPMENT_TEAM" => signing[:team_id],
+      "CURRENT_PROJECT_VERSION" => build_number.to_s,
+      "CODE_SIGN_STYLE" => "Manual",
+      "CODE_SIGN_IDENTITY" => signing[:fingerprint],
+      "YKCAM_PROFILE" => signing[:profile_name]
+    }.map { |key, value| "#{key}=#{value.shellescape}" }.join(" ")
+
+    build_app(
+      project: "YKCam.xcodeproj",
+      scheme: "YKCam",
+      clean: true,
+      export_method: "app-store",
+      archive_path: "build/YKCam.xcarchive",
+      output_directory: "build/ios/ipa",
+      output_name: "YKCam.ipa",
+      buildlog_path: "build/logs",
+      skip_profile_detection: true,
+      xcargs: xcargs,
+      export_options: {
+        signingStyle: "manual",
+        signingCertificate: signing[:fingerprint],
+        teamID: signing[:team_id],
+        provisioningProfiles: {
+          APP_BUNDLE_ID => signing[:profile_name]
+        }
+      }
+    )
+
+    Dir.chdir("..") do
+      sh(
+        "python3", "ci/verify_release.py",
+        "--archive", "build/YKCam.xcarchive",
+        "--ipa", "build/ios/ipa/YKCam.ipa",
+        "--team-id", signing[:team_id],
+        "--version", version,
+        "--build-number", build_number.to_s
+      )
+    end
+
+    fresh_api_key = apple_api
+    upload_to_testflight(
+      api_key: fresh_api_key,
+      app_identifier: APP_BUNDLE_ID,
+      ipa: "build/ios/ipa/YKCam.ipa",
+      skip_waiting_for_build_processing: false
+    )
+    append_summary("### TestFlight upload complete\nVersion #{version}, build #{build_number}. App Store review is a separate step.")
+  end
+end

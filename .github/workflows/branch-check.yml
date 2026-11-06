@@ -1,0 +1,114 @@
+name: Branch build and tests
+
+# Unsigned simulator build and unit tests. No secrets, no upload. Only pushes to this repository run it.
+on:
+  push:
+    branches:
+      - 'feature/**'
+    paths:
+      - 'YKCam/**'
+      - 'Tests/**'
+      - 'project.yml'
+      - '.github/workflows/branch-check.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: branch-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  syntax:
+    name: Swift syntax gate (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Parse every Swift file
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v swiftc >/dev/null; then
+            echo "::warning::swiftc is not installed on this runner; skipping the syntax gate."
+            exit 0
+          fi
+          swiftc --version
+          find YKCam Tests -name '*.swift' -print0 | xargs -0 swiftc -parse
+
+  test:
+    name: Simulator build and tests
+    needs: syntax
+    runs-on: macos-15
+    timeout-minutes: 18
+    env:
+      XCODEGEN_VERSION: '2.46.0'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1
+        with:
+          xcode-version: '26.3'
+
+      - name: Install XcodeGen
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/xcodegen.zip" "https://github.com/yonaskolb/XcodeGen/releases/download/$XCODEGEN_VERSION/xcodegen.zip"
+          unzip -q "$RUNNER_TEMP/xcodegen.zip" -d "$RUNNER_TEMP/xcodegen"
+          echo "$(dirname "$(find "$RUNNER_TEMP/xcodegen" -type f -name xcodegen | head -n 1)")" >> "$GITHUB_PATH"
+
+      - name: Generate project
+        run: |
+          xcodegen --version
+          xcodegen generate
+
+      - name: Pick and boot an iPhone simulator
+        id: sim
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          phones = [d for group in json.load(sys.stdin)["devices"].values() for d in group if d.get("isAvailable") and d["name"].startswith("iPhone")]
+          print("udid=" + phones[0]["udid"])
+          print("name=" + phones[0]["name"])
+          ' >> "$GITHUB_OUTPUT"
+          # 先开机再测；在 xcodebuild test 里冷启动模拟器曾经卡到超时
+          UDID="$(grep '^udid=' "$GITHUB_OUTPUT" | tail -n 1 | cut -d= -f2)"
+          xcrun simctl boot "$UDID" 2>/dev/null || true
+          xcrun simctl bootstatus "$UDID" -b
+
+      - name: Build and test on simulator
+        timeout-minutes: 10
+        shell: bash
+        env:
+          DEVICE_ID: ${{ steps.sim.outputs.udid }}
+        run: |
+          set -euo pipefail
+          mkdir -p build/logs
+          echo "Simulator: ${{ steps.sim.outputs.name }}"
+          xcodebuild test \
+            -project YKCam.xcodeproj \
+            -scheme YKCam \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$DEVICE_ID" \
+            -derivedDataPath build/dd \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            > build/logs/branch-tests.log 2>&1 || {
+              grep -E "error:|failed|FAILED" build/logs/branch-tests.log | head -n 80 || true
+              tail -n 120 build/logs/branch-tests.log
+              exit 1
+            }
+          grep -E "Test Suite|Executed|warning: .*YKCam/" build/logs/branch-tests.log | tail -n 40 || true
