@@ -36,7 +36,7 @@ final class LiveAudio {
         CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
             sample, bufferListSizeNeededOut: &listSize, bufferListOut: nil,
             bufferListSize: 0, blockBufferAllocator: nil, blockBufferMemoryAllocator: nil,
-            flags: 0, audioBufferListOut: nil
+            flags: 0, blockBufferOut: nil
         )
         guard listSize > 0 else { return }
         let rawList = UnsafeMutableRawPointer.allocate(byteCount: listSize, alignment: MemoryLayout<AudioBufferList>.alignment)
