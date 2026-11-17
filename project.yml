@@ -6,9 +6,10 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "0.3.0"
+    MARKETING_VERSION: "0.4.0"
     CURRENT_PROJECT_VERSION: "1"
     YKCAM_PROFILE: "match AppStore com.rookiei1.ykcam"
+    YKCAM_SERVER_URL: ""
 targets:
   YKCam:
     type: application
@@ -21,6 +22,7 @@ targets:
         # 版本号跟着工程设置走（XcodeGen 默认写 1.0，会和 MARKETING_VERSION 对不上，发布检查会拦下）
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        YKCAMServerURL: $(YKCAM_SERVER_URL)
         UIBackgroundModes:
           - audio
         NSPhotoLibraryAddUsageDescription: 手机被人拿走时的前置录像，录完存一份到相册。
@@ -36,8 +38,8 @@ targets:
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
         INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: UIInterfaceOrientationPortrait
         INFOPLIST_KEY_UIStatusBarHidden: YES
-        INFOPLIST_KEY_NSCameraUsageDescription: 对着门拍照录像；手机被人拿起时用前置摄像头拍拿手机的人。照片和录像只存在这台手机上。
-        INFOPLIST_KEY_NSMicrophoneUsageDescription: 录像时同时录声音，只存在这台手机上。
+        INFOPLIST_KEY_NSCameraUsageDescription: 对着门拍照录像和传实时画面；手机被人拿起时用前置摄像头拍拿手机的人。
+        INFOPLIST_KEY_NSMicrophoneUsageDescription: 录像与实时监听声音；已配对服务器时同步上传。
         INFOPLIST_KEY_NSMotionUsageDescription: 感觉手机是否被人拿起、碰歪。
         INFOPLIST_KEY_NSFaceIDUsageDescription: 只有机主能停止警报、停止监控和查看记录。
         INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription: 手机被人拿走时的前置录像，录完存一份到相册。

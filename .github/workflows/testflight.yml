@@ -109,6 +109,7 @@ jobs:
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD_NEXT }}
           SIGNING_CERTIFICATE_ID: ${{ secrets.SIGNING_CERTIFICATE_ID }}
           SIGNING_STORE_URL: ${{ secrets.SIGNING_STORE_URL }}
+          YKCAM_SERVER_URL: ${{ secrets.YKCAM_SERVER_URL }}
 
       - name: Remove temporary keys and keychain
         if: always()

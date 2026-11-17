@@ -143,13 +143,16 @@ Profile prepared for `#{APP_BUNDLE_ID}` with the existing certificate.")
     floor = 1000 + ENV.fetch("GITHUB_RUN_NUMBER", "1").to_i
     build_number = [latest.to_i + 1, floor].max
 
-    xcargs = {
+    xcargs_map = {
       "DEVELOPMENT_TEAM" => signing[:team_id],
       "CURRENT_PROJECT_VERSION" => build_number.to_s,
       "CODE_SIGN_STYLE" => "Manual",
       "CODE_SIGN_IDENTITY" => signing[:fingerprint],
       "YKCAM_PROFILE" => signing[:profile_name]
-    }.map { |key, value| "#{key}=#{value.shellescape}" }.join(" ")
+    }
+    server_url = ENV["YKCAM_SERVER_URL"].to_s.strip
+    xcargs_map["YKCAM_SERVER_URL"] = server_url unless server_url.empty?
+    xcargs = xcargs_map.map { |key, value| "#{key}=#{value.shellescape}" }.join(" ")
 
     build_app(
       project: "YKCam.xcodeproj",

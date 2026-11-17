@@ -1,10 +1,11 @@
 import AVFoundation
 import Foundation
 
-/// 监控的整条流水线，全部在手机本地运行，不连任何服务器：
-/// 画面有变化 → 拍照 + 录像；手机被动了 → 前后摄像头拍照，马上开始前置录像；
-/// 一直被拿着走 → 警报 + 喊话 + 继续录像，每 30 秒存一段进相册。
-/// 不绑主线程，画面在 CameraEngine 的 videoQueue 上进来。界面通过 onFlash / onAlarm 收通知。
+/// 监控的整条流水线，同时兼顾本机存证与连服务器推送/实时观看：
+/// 画面有变化 → 拍照 + 录像（本地存一份，配对服务器后同步上传）；
+/// 手机被动了 → 前后摄像头拍照，马上开始前置录像（本地存，同时流式上传服务器）；
+/// 一直被拿着走 → 推送最高级提醒 + 警报 + 喊话 + 继续录像，每 30 秒存一段进相册；
+/// 有人在主手机看实时或听声音 → 通过 WebSocket 按需转发画面和声音。
 final class Pipeline {
     struct Detection {
         var roi: [Double] = [0, 0, 1, 1]
@@ -24,6 +25,9 @@ final class Pipeline {
     let motion = MotionGuard()
     let siren = Siren()
     let clip = ClipRecorder()
+    let video = VideoRecorder()
+    let link = LiveLink()
+    let liveAudio = LiveAudio()
     let store: RecordStore
 
     private let detector = Detector()
@@ -31,8 +35,11 @@ final class Pipeline {
 
     // 下面这些都在 lock 里读写
     private var detection = Detection()
-    private var shots: [(due: TimeInterval, seq: Int, id: String)] = []
+    private var cloudEnabled = false
+    private var armed = true
+    private var shots: [(due: TimeInterval, seq: Int, id: String, time: TimeInterval, kind: String)] = []
     private var firstHitJPEG: Data?
+    private var lastLive: TimeInterval = 0
     private var switching = false
     private var armedAt: TimeInterval = .infinity
     private var lastFrame: TimeInterval = 0
@@ -50,6 +57,9 @@ final class Pipeline {
 
     init(store: RecordStore = .shared) {
         self.store = store
+        liveAudio.onChunk = { [weak self] chunk in
+            self?.link.sendAudio(chunk)
+        }
     }
 
     static func clock() -> String {
@@ -59,6 +69,14 @@ final class Pipeline {
     }
 
     func setDetection(_ d: Detection) { lock.withLock { detection = d } }
+    func setCloudEnabled(_ on: Bool) { lock.withLock { cloudEnabled = on } }
+
+    func setArmed(_ on: Bool) {
+        lock.withLock { armed = on }
+        if !on { stopAlarm() }
+    }
+
+    var isArmed: Bool { lock.withLock { armed } }
 
     /// 还要多少秒才开始监控；已经开始了返回 0
     var secondsUntilArmed: Int {
@@ -80,14 +98,18 @@ final class Pipeline {
 
     // MARK: 开始 / 结束
 
-    func begin() {
+    func begin(cloud: Bool) {
         let now = Date().timeIntervalSince1970
         lock.withLock {
+            cloudEnabled = cloud
+            armed = true
             armedAt = now + Pipeline.leaveDelay
             switching = false
             shots = []
             intrusionID = nil
+            lastLive = 0
         }
+        liveAudio.reset()
         siren.prepare()
         Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(Pipeline.leaveDelay * 1e9))
@@ -105,7 +127,10 @@ final class Pipeline {
         }
         motion.stop()
         siren.shutdown()
+        link.stop()
+        liveAudio.reset()
         await clip.stop()
+        await video.stop()
         engine.stop()
     }
 
@@ -116,31 +141,53 @@ final class Pipeline {
     // MARK: 每帧（videoQueue 上）
 
     func processFrame(_ buffer: CVPixelBuffer, _ now: TimeInterval) {
-        let (paused, armed, d) = lock.withLock { () -> (Bool, Bool, Detection) in
+        let (paused, ready, d, cloud) = lock.withLock { () -> (Bool, Bool, Detection, Bool) in
             lastFrame = now
             frameCount += 1
-            return (switching, now >= armedAt, detection)
+            return (switching, now >= armedAt, detection, cloudEnabled)
         }
-        guard !paused, armed else { return }
-        takeDueShots(buffer, now)
+        guard !paused else { return }
 
-        guard let gray = CameraEngine.grayscale(buffer) else { return }
-        let result = lock.withLock {
-            detector.feed(gray: gray.pixels, w: gray.w, h: gray.h, now: now, roi: d.roi, sensitivity: d.sensitivity)
+        if ready {
+            takeDueShots(buffer, now, cloud: cloud)
+
+            if let gray = CameraEngine.grayscale(buffer) {
+                let result = lock.withLock {
+                    detector.feed(gray: gray.pixels, w: gray.w, h: gray.h, now: now, roi: d.roi, sensitivity: d.sensitivity)
+                }
+                switch result {
+                case .firstHit:
+                    let jpeg = engine.jpeg(buffer, maxSide: 1280, quality: 0.85)
+                    lock.withLock { firstHitJPEG = jpeg }
+                case .alarm:
+                    startIntrusion(buffer, now, cloud: cloud)
+                default:
+                    break
+                }
+            }
+            finishIntrusionIfQuiet(now, cloud: cloud)
         }
-        switch result {
-        case .firstHit:
-            let jpeg = engine.jpeg(buffer, maxSide: 1280, quality: 0.85)
-            lock.withLock { firstHitJPEG = jpeg }
-        case .alarm:
-            startIntrusion(buffer, now)
-        default:
-            break
+
+        // 有人在主手机看实时：每秒最多 5 帧，长边 800；上一张没发完就跳过
+        if cloud, link.live {
+            let shouldSend = lock.withLock { () -> Bool in
+                guard now - lastLive >= 0.2 else { return false }
+                lastLive = now
+                return true
+            }
+            if shouldSend, let jpeg = engine.jpeg(buffer, maxSide: 800, quality: 0.5) {
+                _ = link.sendFrame(kind: 1, jpeg: jpeg)
+            }
         }
-        finishIntrusionIfQuiet(now)
     }
 
-    private func startIntrusion(_ buffer: CVPixelBuffer, _ now: TimeInterval) {
+    func sendSnapshot() {
+        if let jpeg = engine.currentJPEG() {
+            link.sendFrame(kind: 2, jpeg: jpeg, force: true)
+        }
+    }
+
+    private func startIntrusion(_ buffer: CVPixelBuffer, _ now: TimeInterval, cloud: Bool) {
         let already = lock.withLock { intrusionID != nil }
         if already { return }   // 正在录，靠 lastMotion 延长
         let id = EventID.make(Date(timeIntervalSince1970: now))
@@ -148,35 +195,42 @@ final class Pipeline {
         let first = lock.withLock { firstHitJPEG }
         if let jpeg = first ?? engine.jpeg(buffer, maxSide: 1280, quality: 0.85) {
             store.addPhoto(id: id, seq: 0, jpeg: jpeg)
+            if cloud { Uploader.shared.savePhoto(id: id, seq: 0, time: now, kind: "motion", jpeg: jpeg) }
         }
         clip.start(to: store.newVideoURL(id: id))
+        if cloud { video.start(eventID: id) }
         lock.withLock {
             intrusionID = id
             clipStarted = now
-            shots.append((now + 1, 1, id))
-            shots.append((now + 2.5, 2, id))
+            shots.append((now + 1, 1, id, now, "motion"))
+            shots.append((now + 2.5, 2, id, now, "motion"))
         }
         onFlash?("\(Pipeline.clock()) 有人闯入，正在录像")
     }
 
-    private func finishIntrusionIfQuiet(_ now: TimeInterval) {
-        let stop = lock.withLock { () -> Bool in
-            guard intrusionID != nil else { return false }
+    private func finishIntrusionIfQuiet(_ now: TimeInterval, cloud: Bool) {
+        let stopSeconds = lock.withLock { () -> Int? in
+            guard intrusionID != nil else { return nil }
             let age = now - clipStarted
             let quiet = now - detector.lastMotion
-            guard age >= Pipeline.maxClip || (age >= Pipeline.minClip && quiet > Pipeline.quietStop) else { return false }
+            guard age >= Pipeline.maxClip || (age >= Pipeline.minClip && quiet > Pipeline.quietStop) else { return nil }
             intrusionID = nil
-            return true
+            return max(1, Int(age.rounded()))
         }
-        if stop { Task { await self.closeClip(saveToPhotos: self.saveIntrusionToPhotos) } }
+        if let sec = stopSeconds {
+            Task {
+                await self.closeClip(saveToPhotos: self.saveIntrusionToPhotos)
+                if cloud { await self.video.stop(clipSeconds: sec) }
+            }
+        }
     }
 
     private func closeClip(saveToPhotos: Bool) async {
         if let url = await clip.stop(), saveToPhotos { PhotoSaver.save(video: url) }
     }
 
-    private func takeDueShots(_ buffer: CVPixelBuffer, _ now: TimeInterval) {
-        let due = lock.withLock { () -> [(due: TimeInterval, seq: Int, id: String)] in
+    private func takeDueShots(_ buffer: CVPixelBuffer, _ now: TimeInterval, cloud: Bool) {
+        let due = lock.withLock { () -> [(due: TimeInterval, seq: Int, id: String, time: TimeInterval, kind: String)] in
             let ready = shots.filter { $0.due <= now }
             shots.removeAll { $0.due <= now }
             return ready
@@ -184,6 +238,7 @@ final class Pipeline {
         for s in due {
             if let jpeg = engine.jpeg(buffer, maxSide: 1280, quality: 0.85) {
                 store.addPhoto(id: s.id, seq: s.seq, jpeg: jpeg)
+                if cloud { Uploader.shared.savePhoto(id: s.id, seq: s.seq, time: s.time, kind: s.kind, jpeg: jpeg) }
             }
         }
     }
@@ -192,28 +247,34 @@ final class Pipeline {
     // 照片序号 0、1 后置，5、6 前置。摄像头不会被占去做别的，从拿起开始一直有录像。
 
     func handleMoved() async {
-        let busy = lock.withLock { () -> Bool in
-            if switching { return true }
+        let (busy, cloud) = lock.withLock { () -> (Bool, Bool) in
+            if switching { return (true, cloudEnabled) }
             switching = true
             intrusionID = nil
-            return false
+            return (false, cloudEnabled)
         }
         if busy { return }
         motion.paused = true
         await closeClip(saveToPhotos: saveIntrusionToPhotos)
+        if cloud { await video.stop() }
 
-        let id = EventID.make()
-        store.create(id: id, time: Date().timeIntervalSince1970, kind: .moved)
+        let now = Date().timeIntervalSince1970
+        let id = EventID.make(Date(timeIntervalSince1970: now))
+        store.create(id: id, time: now, kind: .moved)
         onFlash?("\(Pipeline.clock()) 手机被动了，正在拍照录像")
-        if let j = engine.currentJPEG() { store.addPhoto(id: id, seq: 0, jpeg: j) }
+        if let j = engine.currentJPEG() {
+            store.addPhoto(id: id, seq: 0, jpeg: j)
+            if cloud { Uploader.shared.savePhoto(id: id, seq: 0, time: now, kind: "moved", jpeg: j) }
+        }
 
         do {
             try await engine.switchTo(.front)
             clip.start(to: store.newVideoURL(id: id))
+            if cloud { video.start(eventID: id) }
             try await Task.sleep(nanoseconds: 400_000_000)   // 等前置曝光稳定
-            saveFrontPhoto(id: id, seq: 5)
+            saveFrontPhoto(id: id, seq: 5, time: now, cloud: cloud)
             try await Task.sleep(nanoseconds: 800_000_000)
-            saveFrontPhoto(id: id, seq: 6)
+            saveFrontPhoto(id: id, seq: 6, time: now, cloud: cloud)
         } catch {
             onFlash?("前置摄像头没拍成：\(error.localizedDescription)")
         }
@@ -221,12 +282,23 @@ final class Pipeline {
         await closeClip(saveToPhotos: carried || saveIntrusionToPhotos)
         if carried {
             store.setKind(id: id, kind: .theft)
-            await theftMode(id: id)
+            if cloud {
+                _ = await ServerAPI.upload("api/camera/theft",
+                                           query: ["id": id, "m": "0.00", "how": "motion"],
+                                           body: Data(), contentType: "application/octet-stream")
+            }
+            if isArmed {
+                await theftMode(id: id)
+            }
         }
+        if cloud { await video.stop() }
         do {
             try await engine.switchTo(.back)
             try await Task.sleep(nanoseconds: 400_000_000)
-            if let j = engine.currentJPEG() { store.addPhoto(id: id, seq: 1, jpeg: j) }
+            if let j = engine.currentJPEG() {
+                store.addPhoto(id: id, seq: 1, jpeg: j)
+                if cloud { Uploader.shared.savePhoto(id: id, seq: 1, time: now, kind: "moved", jpeg: j) }
+            }
         } catch {
             onFlash?("切回后置摄像头失败：\(error.localizedDescription)")
         }
@@ -235,11 +307,12 @@ final class Pipeline {
         motion.paused = false
     }
 
-    /// 拍到拿手机的人：存手机，也马上存相册（开了 iCloud 照片就会同步走）
-    private func saveFrontPhoto(id: String, seq: Int) {
+    /// 拍到拿手机的人：存手机、上传服务器（若已配对），也马上存相册（开了 iCloud 照片就会同步走）
+    private func saveFrontPhoto(id: String, seq: Int, time: TimeInterval, cloud: Bool) {
         guard let j = engine.currentJPEG() else { return }
         store.addPhoto(id: id, seq: seq, jpeg: j)
         PhotoSaver.save(image: store.url(id: id, name: "photo-\(seq).jpg"))
+        if cloud { Uploader.shared.savePhoto(id: id, seq: seq, time: time, kind: "moved", jpeg: j) }
     }
 
     /// 动作传感器看 30 秒：一直在晃，而且没放回原来的朝向，就当作被拿着走了
@@ -276,7 +349,7 @@ final class Pipeline {
             let chunkStart = Date().timeIntervalSince1970
             while Date().timeIntervalSince1970 - chunkStart < Pipeline.theftChunk {
                 try? await Task.sleep(nanoseconds: 500_000_000)
-                let stop = lock.withLock { theftStopRequested }
+                let stop = lock.withLock { theftStopRequested || !armed }
                 if stop || Date().timeIntervalSince1970 - started > Pipeline.theftLimit {
                     finished = true
                     break
@@ -288,11 +361,12 @@ final class Pipeline {
         onAlarm?(false)
     }
 
-    // MARK: 监控被切走、锁屏：马上响。回来后要机主验证才停
+    // MARK: 监控被切走、锁屏：布防时马上响。回来后要机主验证才停
 
     func tamperAlarm(shot: Data?) {
         // armedAt 没到（还在倒计时）不算；没开始监控时 armedAt 是无穷大，也不算
-        guard lock.withLock({ Date().timeIntervalSince1970 >= armedAt }), !siren.sounding else { return }
+        let canSound = lock.withLock { Date().timeIntervalSince1970 >= armedAt && armed }
+        guard canSound, !siren.sounding else { return }
         let id = EventID.make()
         store.create(id: id, time: Date().timeIntervalSince1970, kind: .left)
         if let shot { store.addPhoto(id: id, seq: 0, jpeg: shot) }
@@ -300,7 +374,7 @@ final class Pipeline {
         onAlarm?(true)
     }
 
-    /// 机主验证通过后调用：停警报，回到监控
+    /// 机主验证通过（或主力手机撤防）后调用：停警报，回到监控
     func stopAlarm() {
         lock.withLock { theftStopRequested = true }
         siren.sound(false)

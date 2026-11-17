@@ -13,6 +13,7 @@ struct YKCamApp: App {
                 .environmentObject(model)
                 .preferredColorScheme(.dark)
                 .statusBarHidden(true)
+                .task { await model.checkPairing() }
         }
         .onChange(of: scenePhase) { _, phase in model.sceneChanged(phase) }
     }
@@ -25,11 +26,77 @@ struct RootView: View {
         ZStack {
             Color.black.ignoresSafeArea()
             switch model.phase {
+            case .loading: ProgressView()
+            case .pair: PairView()
             case .ready: ReadyView()
             case .running: RunningView()
             }
         }
         .sheet(isPresented: $model.showRecords) { RecordsView() }
+    }
+}
+
+// MARK: 配对服务器
+
+struct PairView: View {
+    @EnvironmentObject var model: AppModel
+    @State private var code = ""
+    @State private var busy = false
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("连接服务器监控").font(.title2.bold())
+                Text("在你的主力手机上打开监控网页 →「设置」→「添加摄像头手机」，拿到 6 位配对码填在下面。")
+                    .foregroundStyle(.secondary)
+
+                Text("服务器地址").font(.subheadline).foregroundStyle(.secondary)
+                TextField("https://...", text: $model.serverInput)
+                    .keyboardType(.URL)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .textFieldStyle(.roundedBorder)
+
+                Text("摄像头名称").font(.subheadline).foregroundStyle(.secondary)
+                TextField("例如：iPhone 13", text: $model.camName)
+                    .textFieldStyle(.roundedBorder)
+
+                Text("6 位配对码").font(.subheadline).foregroundStyle(.secondary)
+                TextField("输入 6 位数字", text: $code)
+                    .keyboardType(.numberPad)
+                    .textFieldStyle(.roundedBorder)
+
+                Button {
+                    busy = true
+                    Task {
+                        await model.pair(server: model.serverInput, code: code, name: model.camName)
+                        busy = false
+                    }
+                } label: {
+                    Text(busy ? "配对中…" : "配对并连接").frame(maxWidth: .infinity).padding(.vertical, 6)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(busy || code.trimmingCharacters(in: .whitespaces).count != 6 || ServerAPI.normalizeBaseURL(model.serverInput) == nil)
+
+                if model.isPaired {
+                    Button("解除当前服务器配对（只在本机用）", role: .destructive) {
+                        Task { await model.unpairWithAuth() }
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                Button(model.canReturnFromPair ? "返回准备页" : "暂不配对，只在本机使用") {
+                    model.useLocalOnly()
+                }
+                .buttonStyle(.bordered)
+
+                if !model.errorText.isEmpty { Text(model.errorText).foregroundStyle(.red) }
+
+                Text("配对后这台手机会把报警照片、录像和实时画面/声音发到你的服务器，同时手机本地仍保留一份记录。放在门口被人拿到也看不了历史记录和他人画面。")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            .padding(20)
+        }
     }
 }
 
@@ -44,8 +111,34 @@ struct ReadyView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 Text("门口摄像头").font(.title2.bold())
-                Text("只在这台手机上工作，不连任何服务器。照片和录像都存在手机里。")
-                    .foregroundStyle(.secondary)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    if model.isPaired {
+                        Text("已连接服务器：\(model.camName)")
+                            .font(.subheadline.bold())
+                            .foregroundStyle(.green)
+                        if !ServerAPI.hostLabel.isEmpty {
+                            Text("服务器 \(ServerAPI.hostLabel) · 照片、录像、实时画面与声音已接入")
+                                .font(.footnote).foregroundStyle(.secondary)
+                        }
+                        Button("更换或解除服务器配对") {
+                            Task { await model.managePairingWithAuth() }
+                        }
+                        .buttonStyle(.bordered)
+                    } else {
+                        Text("当前为仅本机模式，不上传服务器。")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        Button("连接服务器监控") {
+                            model.openPairing()
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(white: 0.12))
+                .clipShape(RoundedRectangle(cornerRadius: 12))
 
                 Text("后置镜头").font(.subheadline).foregroundStyle(.secondary)
                 Picker("后置镜头", selection: $model.lens) {
@@ -76,7 +169,7 @@ struct ReadyView: View {
                 Button {
                     Task { await model.openRecords() }
                 } label: {
-                    Text("查看记录").frame(maxWidth: .infinity)
+                    Text("查看本机记录").frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
 
@@ -89,10 +182,9 @@ struct ReadyView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("1. 手机插上充电器，音量调到最大，后置摄像头对着门。点开始后有 30 秒让你放好、离开。")
                     Text("2. 连按三次侧边按钮打开「引导式访问」，关掉侧边按钮和音量按钮，「触摸」留着（停止警报要用），点「开始」。")
-                    Text("3. 有人闯入：拍 3 张照片并录像，没动静 30 秒后停（至少 1 分钟，最长 10 分钟）。")
-                    Text("4. 手机被拿起：马上拍照，前置开始录像，拿手机的人的照片立刻存进相册。一直被拿着走：警报 + 喊话，录像每 30 秒存一段进相册。")
-                    Text("5. 监控中 App 被切走或锁屏也会响。停止警报、停止监控、查看记录都要面容 ID 或锁屏密码。")
-                    Text("6. 手机被拿走时证据也在这台手机上。打开 iCloud 照片，存进相册的录像会自动同步走；再打开「查找我的 iPhone」。")
+                    Text("3. 有人闯入：拍 3 张照片并录像，没动静 30 秒后停（至少 1 分钟，最长 10 分钟）；已配对服务器时同步推送和上传。")
+                    Text("4. 手机被拿起：马上拍照，前置开始录像并流式传到服务器，拿手机的人的照片立刻存进相册。一直被拿着走：推送提醒、警报 + 喊话，录像每 30 秒存一段进相册。")
+                    Text("5. 监控中 App 被切走或锁屏也会响并通知服务器。停止警报、停止监控、查看本机记录都要面容 ID 或锁屏密码；也可以在主力手机上撤防。")
                 }
                 .font(.footnote).foregroundStyle(.secondary)
             }
@@ -217,7 +309,7 @@ struct AlarmScreen: View {
         VStack(spacing: 18) {
             Text("⚠️").font(.system(size: 80))
             Text("这台手机正在报警").font(.largeTitle.bold())
-            Text("你的脸和声音正在被录下。\n请把手机放回原处。")
+            Text("你的脸和声音正在被录下\(model.isPaired ? "并传到服务器" : "")。\n请把手机放回原处。")
                 .font(.title3).multilineTextAlignment(.center)
             Button("机主：停止警报") {
                 Task { await model.stopAlarmWithAuth() }
@@ -259,11 +351,11 @@ struct RecordsView: View {
                         for i in offsets { model.delete(model.records[i]) }
                     }
                 } footer: {
-                    Text("共占用 \(ByteCountFormatter.string(fromByteCount: model.usedBytes, countStyle: .file))，保留 \(model.keepDays) 天。手机空间不足 2 GB 时会先删最早的。")
+                    Text("本机共占用 \(ByteCountFormatter.string(fromByteCount: model.usedBytes, countStyle: .file))，保留 \(model.keepDays) 天。手机空间不足 2 GB 时会先删最早的。")
                 }
             }
             .overlay { if model.records.isEmpty { Text("还没有记录").foregroundStyle(.secondary) } }
-            .navigationTitle("记录")
+            .navigationTitle("本机记录")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { Button("关闭") { dismiss() } }
         }
